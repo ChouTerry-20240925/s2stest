@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>S2S 專業對講機版 (省錢模式)</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; background-color: #f8f9fa; }
+        #mainBtn { padding: 20px; font-size: 18px; font-weight: bold; background: #007bff; color: white; border: none; border-radius: 10px; cursor: pointer; width: 100%; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); transition: all 0.2s ease; user-select: none; -webkit-user-select: none; }
+        #mainBtn.ready { background: #28a745; }
+        #mainBtn.recording { background: #dc3545; transform: scale(0.98) translateY(2px); }
+        #log { background: #212529; color: #00ff00; padding: 15px; border-radius: 5px; height: 350px; overflow-y: auto; font-family: monospace; font-size: 14px; line-height: 1.5; }
+        .highlight { color: #ffc107; }
+        .status-dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .dot-online { background-color: #28a745; }
+    </style>
+</head>
+<body>
+    <h2>S2S 專業版 (按需連線)</h2>
+    <p><span id="statusDot" class="status-dot"></span> 狀態：<span id="statusTxt">未連線</span></p>
+    <button id="mainBtn">按住開始對話</button>
+    <div id="log">系統日誌：等待操作...<br></div>
+
+    <script>
+        const logArea = document.getElementById('log');
+        const mainBtn = document.getElementById('mainBtn');
+        const statusDot = document.getElementById('statusDot');
+        const statusTxt = document.getElementById('statusTxt');
+        
+        function addLog(msg) { logArea.innerHTML += `> ${msg}<br>`; logArea.scrollTop = logArea.scrollHeight; }
+
+        // 🚨 記得換成你的 Render 網址 🚨
+        const BACKEND_WS_URL = "wss://s2stest.onrender.com/ws"; 
+
+        let ws;
+        let isRecording = false;
+        let playAudioContext;
+        let nextPlayTime = 0;
+        let mediaStream;
+        let processor;
+
+        // 初始化播放器
+        function initAudio() {
+            if (!playAudioContext) playAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+            if (playAudioContext.state === 'suspended') playAudioContext.resume();
+        }
+
+        // 事件監聽
+        mainBtn.addEventListener('mousedown', startAction);
+        mainBtn.addEventListener('mouseup', stopAction);
+        mainBtn.addEventListener('mouseleave', stopAction);
+        mainBtn.addEventListener('touchstart', startAction, {passive: false});
+        mainBtn.addEventListener('touchend', stopAction, {passive: false});
+
+        async function startAction(e) {
+            e.preventDefault();
+            if (isRecording) return;
+            
+            isRecording = true;
+            initAudio();
+            mainBtn.classList.add('recording');
+            mainBtn.innerText = "🎙️ 正在連線並錄音...";
+            
+            // 每次按住時，重新建立連線
+            connectAndStream();
+        }
+
+        function stopAction(e) {
+            e.preventDefault();
+            if (!isRecording) return;
+            
+            isRecording = false;
+            mainBtn.classList.remove('recording');
+            mainBtn.innerText = "按住開始對話";
+            
+            // 告訴 Gemini 使用者說完了
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+                addLog("停止錄音，等待回應...");
+            }
+        }
+
+        async function connectAndStream() {
+            try {
+                ws = new WebSocket(BACKEND_WS_URL);
+
+                ws.onopen = () => {
+                    updateStatus(true);
+                    // 1. 送出 Setup
+                    ws.send(JSON.stringify({
+                        setup: {
+                            model: "models/gemini-2.5-flash-native-audio-preview-12-2025",
+                            generationConfig: {
+                                responseModalities: ["AUDIO"],
+                                speechConfig: {
+                                    voiceConfig: {
+                                        prebuiltVoiceConfig: { voiceName: "Aoede" }
+                                    }
+                                },
+                                thinkingConfig: { thinkingBudget: 0 }
+                            },
+                            realtimeInputConfig: {
+                                automaticActivityDetection: { disabled: true }
+                            },
+                            systemInstruction: { parts: [{ text: "你是一個語音助理，只能根據 search_database 工具回傳的資料來回答。用最少的字數完整傳達答案，不重複、不補充、不解釋，直接說重點。如果工具回傳的資料與問題無關，或資料中沒有答案，請直接說「抱歉，我不知道」，不要自行推測。" }] },
+                            tools: [{ function_declarations: [{ name: "search_database", description: "查詢資料庫資訊", parameters: { type: "OBJECT", properties: { query: { type: "STRING" } }, required: ["query"] } }] }]
+                        }
+                    }));
+                    addLog("連線成功，傳送語音中...");
+                    startMicStreaming();
+                    ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+                };
+
+                ws.onmessage = async (event) => {
+                    const response = JSON.parse(event.data);
+                    if (response.serverContent && response.serverContent.modelTurn) {
+                        const parts = response.serverContent.modelTurn.parts;
+                        for (const part of parts) {
+                            if (part.inlineData && part.inlineData.data) {
+                                addLog("播放音訊 mimeType: " + part.inlineData.mimeType);
+                                try {
+                                    await playAudioChunk(part.inlineData.data, part.inlineData.mimeType);
+                                } catch(e) {
+                                    addLog("播放錯誤: " + e);
+                                }
+                            }
+                        }
+                    }
+                    // 如果 Gemini 說完了（turnComplete），我們可以選擇在此斷開或等一段時間
+                    if (response.serverContent && response.serverContent.turnComplete) {
+                        addLog("對話回合結束，自動斷線。");
+                        setTimeout(() => { if (ws) ws.close(); }, 500);
+                    }
+                };
+
+                ws.onclose = () => {
+                    updateStatus(false);
+                    stopMicStreaming();
+                };
+
+            } catch (err) {
+                addLog("連線失敗: " + err);
+                stopAction(new Event('error'));
+            }
+        }
+
+        async function startMicStreaming() {
+            if (!mediaStream) {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            }
+            const audioCtx = new AudioContext({ sampleRate: 16000 });
+            const source = audioCtx.createMediaStreamSource(mediaStream);
+            processor = audioCtx.createScriptProcessor(4096, 1, 1);
+            
+            source.connect(processor);
+            processor.connect(audioCtx.destination);
+            
+            processor.onaudioprocess = (e) => {
+                if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+                const inputData = e.inputBuffer.getChannelData(0);
+                const pcm16 = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                    pcm16[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
+                }
+                
+                let binary = '';
+                const bytes = new Uint8Array(pcm16.buffer);
+                for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+                const base64Data = window.btoa(binary);
+
+                ws.send(JSON.stringify({ 
+                    realtimeInput: { 
+                        mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: base64Data }] 
+                    } 
+                }));
+            };
+        }
+
+        function stopMicStreaming() {
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+        }
+
+        function updateStatus(online) {
+            statusDot.className = online ? "status-dot dot-online" : "status-dot";
+            statusTxt.innerText = online ? "通話中 (計費中)" : "已斷線 (省錢模式)";
+        }
+
+        async function playAudioChunk(base64Data, mimeType) {
+            if (playAudioContext.state === 'suspended') await playAudioContext.resume();
+            const sampleRate = parseInt((mimeType || '').match(/rate=(\d+)/)?.[1]) || 24000;
+            const binaryString = atob(base64Data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+            const pcm16 = new Int16Array(bytes.buffer);
+            const float32 = new Float32Array(pcm16.length);
+            for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
+
+            const audioBuffer = playAudioContext.createBuffer(1, float32.length, sampleRate);
+            audioBuffer.getChannelData(0).set(float32);
+            const source = playAudioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(playAudioContext.destination);
+            const currentTime = playAudioContext.currentTime;
+            if (nextPlayTime < currentTime) nextPlayTime = currentTime;
+            source.start(nextPlayTime);
+            nextPlayTime += audioBuffer.duration;
+            
+            // 💡 關鍵優化：播完聲音後 3 秒自動斷開，徹底省錢
+            source.onended = () => {
+                setTimeout(() => {
+                    if (!isRecording && ws) ws.close();
+                }, 3000);
+            }
+        }
+    </script>
+</body>
+</html>
