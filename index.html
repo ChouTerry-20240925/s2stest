@@ -65,7 +65,7 @@ registerProcessor('pcm-processor', PCMProcessor);
         let workletLoaded = false;
         let processor;          // 指向目前的 AudioWorkletNode
         let idleTimer = null;
-        const IDLE_TIMEOUT_MS = 15000; // 15 秒無動作自動斷線
+        const IDLE_TIMEOUT_MS = 20000; // 20 秒無動作自動斷線
 
         function setBtnState(state) {
             btnState = state;
@@ -95,7 +95,7 @@ registerProcessor('pcm-processor', PCMProcessor);
         function startIdleTimer() {
             clearIdleTimer();
             idleTimer = setTimeout(() => {
-                addLog("15 秒閒置，自動斷線。");
+                addLog("20 秒閒置，自動斷線。");
                 if (ws) ws.close();
             }, IDLE_TIMEOUT_MS);
         }
@@ -177,7 +177,7 @@ registerProcessor('pcm-processor', PCMProcessor);
                         }
                     }
                     if (response.serverContent && response.serverContent.turnComplete) {
-                        addLog("Gemini 說完了，可按下繼續對話（15 秒後自動斷線）。");
+                        addLog("Gemini 說完了，可按下繼續對話（20 秒後自動斷線）。");
                         setBtnState('ready');
                         startIdleTimer();
                     }
