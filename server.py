@@ -91,8 +91,10 @@ async def websocket_endpoint(client_ws: WebSocket):
                 while True:
                     data = await client_ws.receive_text()
                     await gemini_ws.send(data)
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
-                logger.error(f"[receive_from_client] error: {e}")
+                logger.info(f"[receive_from_client] ended: {e}")
 
         async def receive_from_gemini():
             try:
@@ -124,7 +126,18 @@ async def websocket_endpoint(client_ws: WebSocket):
                         await gemini_ws.send(json.dumps(tool_response))
 
                     await client_ws.send_text(response_text)
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
-                logger.error(f"[receive_from_gemini] error: {e}")
+                logger.info(f"[receive_from_gemini] ended: {e}")
 
-        await asyncio.gather(receive_from_client(), receive_from_gemini())
+        t1 = asyncio.create_task(receive_from_client())
+        t2 = asyncio.create_task(receive_from_gemini())
+        try:
+            await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (t1, t2):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(t1, t2, return_exceptions=True)
+            logger.info("[session] closed")

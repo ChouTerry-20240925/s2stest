@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>S2S 專業對講機版 (省錢模式)</title>
+    <title>新生兒黃疸問答AI</title>
     <style>
         body { font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; background-color: #f8f9fa; }
         #mainBtn { padding: 20px; font-size: 18px; font-weight: bold; background: #007bff; color: white; border: none; border-radius: 10px; cursor: pointer; width: 100%; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); transition: all 0.2s ease; user-select: none; -webkit-user-select: none; }
@@ -15,7 +15,7 @@
     </style>
 </head>
 <body>
-    <h2>S2S 專業版 (按需連線)</h2>
+    <h2>新生兒黃疸問答</h2>
     <p><span id="statusDot" class="status-dot"></span> 狀態：<span id="statusTxt">未連線</span></p>
     <button id="mainBtn">按住開始對話</button>
     <div id="log">系統日誌：等待操作...<br></div>
@@ -36,7 +36,10 @@
         let playAudioContext;
         let nextPlayTime = 0;
         let mediaStream;
+        let micAudioCtx;   // 跨回合重用，避免每次建立新 AudioContext
         let processor;
+        let idleTimer = null;
+        const IDLE_TIMEOUT_MS = 15000; // 15 秒無動作自動斷線
 
         // 初始化播放器
         function initAudio() {
@@ -51,27 +54,48 @@
         mainBtn.addEventListener('touchstart', startAction, {passive: false});
         mainBtn.addEventListener('touchend', stopAction, {passive: false});
 
+        function startIdleTimer() {
+            clearIdleTimer();
+            idleTimer = setTimeout(() => {
+                addLog("15 秒閒置，自動斷線。");
+                if (ws) ws.close();
+            }, IDLE_TIMEOUT_MS);
+        }
+
+        function clearIdleTimer() {
+            if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        }
+
         async function startAction(e) {
             e.preventDefault();
             if (isRecording) return;
-            
+
             isRecording = true;
+            clearIdleTimer();
             initAudio();
             mainBtn.classList.add('recording');
-            mainBtn.innerText = "🎙️ 正在連線並錄音...";
-            
-            // 每次按住時，重新建立連線
-            connectAndStream();
+            mainBtn.classList.remove('ready');
+            mainBtn.innerText = "🎙️ 錄音中...";
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // 同一個 Gemini session，直接繼續下一輪
+                await startMicStreaming();
+                ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+                addLog("繼續對話，傳送語音中...");
+            } else {
+                connectAndStream();
+            }
         }
 
         function stopAction(e) {
             e.preventDefault();
             if (!isRecording) return;
-            
+
             isRecording = false;
             mainBtn.classList.remove('recording');
-            mainBtn.innerText = "按住開始對話";
-            
+            mainBtn.innerText = "等待回應...";
+            stopMicStreaming();
+
             // 告訴 Gemini 使用者說完了
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
@@ -125,16 +149,22 @@
                             }
                         }
                     }
-                    // 如果 Gemini 說完了（turnComplete），我們可以選擇在此斷開或等一段時間
+                    // turnComplete：保持連線，等使用者繼續說話；30 秒無動作再斷線
                     if (response.serverContent && response.serverContent.turnComplete) {
-                        addLog("對話回合結束，自動斷線。");
-                        setTimeout(() => { if (ws) ws.close(); }, 500);
+                        addLog("Gemini 說完了，可按住繼續對話（30 秒後自動斷線）。");
+                        mainBtn.classList.remove('recording');
+                        mainBtn.classList.add('ready');
+                        mainBtn.innerText = "按住繼續對話";
+                        startIdleTimer();
                     }
                 };
 
                 ws.onclose = () => {
                     updateStatus(false);
                     stopMicStreaming();
+                    clearIdleTimer();
+                    mainBtn.classList.remove('recording', 'ready');
+                    mainBtn.innerText = "按住開始對話";
                 };
 
             } catch (err) {
@@ -147,13 +177,16 @@
             if (!mediaStream) {
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             }
-            const audioCtx = new AudioContext({ sampleRate: 16000 });
-            const source = audioCtx.createMediaStreamSource(mediaStream);
-            processor = audioCtx.createScriptProcessor(4096, 1, 1);
-            
+            // 跨回合重用同一個 AudioContext，避免資源洩漏
+            if (!micAudioCtx) {
+                micAudioCtx = new AudioContext({ sampleRate: 16000 });
+            }
+            const source = micAudioCtx.createMediaStreamSource(mediaStream);
+            processor = micAudioCtx.createScriptProcessor(4096, 1, 1);
+
             source.connect(processor);
-            processor.connect(audioCtx.destination);
-            
+            processor.connect(micAudioCtx.destination);
+
             processor.onaudioprocess = (e) => {
                 if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -162,16 +195,16 @@
                 for (let i = 0; i < inputData.length; i++) {
                     pcm16[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
                 }
-                
+
                 let binary = '';
                 const bytes = new Uint8Array(pcm16.buffer);
                 for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
                 const base64Data = window.btoa(binary);
 
-                ws.send(JSON.stringify({ 
-                    realtimeInput: { 
-                        mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: base64Data }] 
-                    } 
+                ws.send(JSON.stringify({
+                    realtimeInput: {
+                        mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: base64Data }]
+                    }
                 }));
             };
         }
@@ -207,13 +240,6 @@
             if (nextPlayTime < currentTime) nextPlayTime = currentTime;
             source.start(nextPlayTime);
             nextPlayTime += audioBuffer.duration;
-            
-            // 💡 關鍵優化：播完聲音後 3 秒自動斷開，徹底省錢
-            source.onended = () => {
-                setTimeout(() => {
-                    if (!isRecording && ws) ws.close();
-                }, 3000);
-            }
         }
     </script>
 </body>
