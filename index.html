@@ -8,6 +8,7 @@
         #mainBtn { padding: 20px; font-size: 18px; font-weight: bold; background: #007bff; color: white; border: none; border-radius: 10px; cursor: pointer; width: 100%; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); transition: all 0.2s ease; user-select: none; -webkit-user-select: none; }
         #mainBtn.ready { background: #28a745; }
         #mainBtn.recording { background: #dc3545; transform: scale(0.98) translateY(2px); }
+        #mainBtn:disabled { background: #6c757d; cursor: not-allowed; transform: none; }
         #log { background: #212529; color: #00ff00; padding: 15px; border-radius: 5px; height: 350px; overflow-y: auto; font-family: monospace; font-size: 14px; line-height: 1.5; }
         .highlight { color: #ffc107; }
         .status-dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-right: 5px; }
@@ -17,7 +18,7 @@
 <body>
     <h2>新生兒黃疸問答</h2>
     <p><span id="statusDot" class="status-dot"></span> 狀態：<span id="statusTxt">未連線</span></p>
-    <button id="mainBtn">按住開始對話</button>
+    <button id="mainBtn">按下開始對話</button>
     <div id="log">系統日誌：等待操作...<br></div>
 
     <script>
@@ -28,31 +29,68 @@
         
         function addLog(msg) { logArea.innerHTML += `> ${msg}<br>`; logArea.scrollTop = logArea.scrollHeight; }
 
-        // 🚨 記得換成你的 Render 網址 🚨
-        const BACKEND_WS_URL = "wss://s2stest-ib8r.onrender.com"; 
+        // 本地測試用 ws://localhost:8000/ws，部署到 Render 時改回 wss://s2stest-ib8r.onrender.com/ws
+        const BACKEND_WS_URL = "wss://s2stest-ib8r.onrender.com/ws";
+
+        // AudioWorklet processor 程式碼（inline blob，不需要額外的 .js 檔）
+        const PCM_WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this._buf = [];
+    }
+    process(inputs) {
+        const ch = inputs[0]?.[0];
+        if (ch) {
+            for (let i = 0; i < ch.length; i++) this._buf.push(ch[i]);
+            // 每累積 4096 samples（256ms @ 16kHz）送出一包
+            while (this._buf.length >= 4096) {
+                this.port.postMessage(new Float32Array(this._buf.splice(0, 4096)));
+            }
+        }
+        return true;
+    }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
 
         let ws;
-        let isRecording = false;
+        // 狀態機：idle → connecting → recording → waiting → ready → connecting → ...
+        // idle: 未連線  connecting: 等待 WS+mic  recording: 錄音中  waiting: 等 Gemini  ready: 可繼續說
+        let btnState = 'idle';
         let playAudioContext;
         let nextPlayTime = 0;
         let mediaStream;
-        let micAudioCtx;   // 跨回合重用，避免每次建立新 AudioContext
-        let processor;
+        let micAudioCtx;        // 跨回合重用，避免每次建立新 AudioContext
+        let workletLoaded = false;
+        let processor;          // 指向目前的 AudioWorkletNode
         let idleTimer = null;
         const IDLE_TIMEOUT_MS = 15000; // 15 秒無動作自動斷線
 
-        // 初始化播放器
+        function setBtnState(state) {
+            btnState = state;
+            mainBtn.disabled = (state === 'connecting' || state === 'waiting');
+            mainBtn.className = '';
+            const map = {
+                idle:       [null,        "按下開始對話"],
+                connecting: [null,        "連線中..."],
+                recording:  ['recording', "🎙️ 錄音中（再按停止）"],
+                waiting:    [null,        "等待回應..."],
+                ready:      ['ready',     "按下繼續對話"],
+            };
+            const [cls, text] = map[state];
+            if (cls) mainBtn.classList.add(cls);
+            mainBtn.innerText = text;
+        }
+
+        // 初始化播放器（需使用者手勢才能建立 AudioContext）
         function initAudio() {
             if (!playAudioContext) playAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
             if (playAudioContext.state === 'suspended') playAudioContext.resume();
         }
 
-        // 事件監聽
-        mainBtn.addEventListener('mousedown', startAction);
-        mainBtn.addEventListener('mouseup', stopAction);
-        mainBtn.addEventListener('mouseleave', stopAction);
-        mainBtn.addEventListener('touchstart', startAction, {passive: false});
-        mainBtn.addEventListener('touchend', stopAction, {passive: false});
+        // 單一 click 事件，消除 mousedown/mouseup/mouseleave 的競態問題
+        mainBtn.addEventListener('click', handleButtonClick);
 
         function startIdleTimer() {
             clearIdleTimer();
@@ -66,81 +104,70 @@
             if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
         }
 
-        async function startAction(e) {
-            e.preventDefault();
-            if (isRecording) return;
-
-            isRecording = true;
-            clearIdleTimer();
-            initAudio();
-            mainBtn.classList.add('recording');
-            mainBtn.classList.remove('ready');
-            mainBtn.innerText = "🎙️ 錄音中...";
-
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                // 同一個 Gemini session，直接繼續下一輪
-                await startMicStreaming();
-                ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
-                addLog("繼續對話，傳送語音中...");
-            } else {
-                connectAndStream();
+        async function handleButtonClick() {
+            if (btnState === 'idle' || btnState === 'ready') {
+                // 開始錄音
+                clearIdleTimer();
+                initAudio();
+                if (btnState === 'ready' && ws && ws.readyState === WebSocket.OPEN) {
+                    // 同一個 Gemini session，繼續下一輪
+                    setBtnState('connecting');
+                    await startMicStreaming();
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+                        setBtnState('recording');
+                        addLog("繼續對話，傳送語音中...");
+                    }
+                } else {
+                    connectAndStream();
+                }
+            } else if (btnState === 'recording') {
+                // 停止錄音，送給 Gemini
+                stopMicStreaming();
+                setBtnState('waiting');
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+                    addLog("停止錄音，等待回應...");
+                }
             }
-        }
-
-        function stopAction(e) {
-            e.preventDefault();
-            if (!isRecording) return;
-
-            isRecording = false;
-            mainBtn.classList.remove('recording');
-            mainBtn.innerText = "等待回應...";
-            stopMicStreaming();
-
-            // 告訴 Gemini 使用者說完了
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
-                addLog("停止錄音，等待回應...");
-            }
+            // connecting / waiting 狀態下按鈕已 disabled，不會進入此函式
         }
 
         async function connectAndStream() {
+            setBtnState('connecting');
             try {
                 ws = new WebSocket(BACKEND_WS_URL);
 
-                ws.onopen = () => {
+                ws.onopen = async () => {
                     updateStatus(true);
-                    // 1. 送出 Setup
                     ws.send(JSON.stringify({
                         setup: {
                             model: "models/gemini-2.5-flash-native-audio-preview-12-2025",
                             generationConfig: {
                                 responseModalities: ["AUDIO"],
-                                speechConfig: {
-                                    voiceConfig: {
-                                        prebuiltVoiceConfig: { voiceName: "Aoede" }
-                                    }
-                                },
+                                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
                                 thinkingConfig: { thinkingBudget: 0 }
                             },
-                            realtimeInputConfig: {
-                                automaticActivityDetection: { disabled: true }
-                            },
+                            realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
                             systemInstruction: { parts: [{ text: "你是一個語音助理，只能根據 search_database 工具回傳的資料來回答。用最少的字數完整傳達答案，不重複、不補充、不解釋，直接說重點。如果工具回傳的資料與問題無關，或資料中沒有答案，請直接說「抱歉，我不知道」，不要自行推測。" }] },
                             tools: [{ function_declarations: [{ name: "search_database", description: "查詢資料庫資訊", parameters: { type: "OBJECT", properties: { query: { type: "STRING" } }, required: ["query"] } }] }]
                         }
                     }));
-                    addLog("連線成功，傳送語音中...");
-                    startMicStreaming();
-                    ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+                    // 等麥克風與 AudioWorklet 完全就緒後才送 activityStart
+                    await startMicStreaming();
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+                        setBtnState('recording');
+                        addLog("連線成功，傳送語音中...");
+                    }
                 };
 
                 ws.onmessage = async (event) => {
                     const response = JSON.parse(event.data);
+                    if (response.type === 'keepalive') return;
                     if (response.serverContent && response.serverContent.modelTurn) {
-                        const parts = response.serverContent.modelTurn.parts;
-                        for (const part of parts) {
+                        for (const part of response.serverContent.modelTurn.parts) {
                             if (part.inlineData && part.inlineData.data) {
-                                addLog("播放音訊 mimeType: " + part.inlineData.mimeType);
                                 try {
                                     await playAudioChunk(part.inlineData.data, part.inlineData.mimeType);
                                 } catch(e) {
@@ -149,12 +176,9 @@
                             }
                         }
                     }
-                    // turnComplete：保持連線，等使用者繼續說話；30 秒無動作再斷線
                     if (response.serverContent && response.serverContent.turnComplete) {
-                        addLog("Gemini 說完了，可按住繼續對話（30 秒後自動斷線）。");
-                        mainBtn.classList.remove('recording');
-                        mainBtn.classList.add('ready');
-                        mainBtn.innerText = "按住繼續對話";
+                        addLog("Gemini 說完了，可按下繼續對話（15 秒後自動斷線）。");
+                        setBtnState('ready');
                         startIdleTimer();
                     }
                 };
@@ -163,13 +187,12 @@
                     updateStatus(false);
                     stopMicStreaming();
                     clearIdleTimer();
-                    mainBtn.classList.remove('recording', 'ready');
-                    mainBtn.innerText = "按住開始對話";
+                    setBtnState('idle');
                 };
 
             } catch (err) {
                 addLog("連線失敗: " + err);
-                stopAction(new Event('error'));
+                setBtnState('idle');
             }
         }
 
@@ -177,23 +200,28 @@
             if (!mediaStream) {
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             }
-            // 跨回合重用同一個 AudioContext，避免資源洩漏
             if (!micAudioCtx) {
                 micAudioCtx = new AudioContext({ sampleRate: 16000 });
             }
+            // AudioWorklet 只需載入一次
+            if (!workletLoaded) {
+                const blob = new Blob([PCM_WORKLET_CODE], { type: 'application/javascript' });
+                const url = URL.createObjectURL(blob);
+                await micAudioCtx.audioWorklet.addModule(url);
+                URL.revokeObjectURL(url);
+                workletLoaded = true;
+            }
+
             const source = micAudioCtx.createMediaStreamSource(mediaStream);
-            processor = micAudioCtx.createScriptProcessor(4096, 1, 1);
+            processor = new AudioWorkletNode(micAudioCtx, 'pcm-processor');
 
-            source.connect(processor);
-            processor.connect(micAudioCtx.destination);
+            processor.port.onmessage = (event) => {
+                if (btnState !== 'recording' || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-            processor.onaudioprocess = (e) => {
-                if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-                const inputData = e.inputBuffer.getChannelData(0);
-                const pcm16 = new Int16Array(inputData.length);
-                for (let i = 0; i < inputData.length; i++) {
-                    pcm16[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
+                const float32 = event.data; // Float32Array, 4096 samples
+                const pcm16 = new Int16Array(float32.length);
+                for (let i = 0; i < float32.length; i++) {
+                    pcm16[i] = Math.max(-1, Math.min(1, float32[i])) * 32767;
                 }
 
                 let binary = '';
@@ -207,10 +235,14 @@
                     }
                 }));
             };
+
+            source.connect(processor);
+            // AudioWorkletNode 不需要接到 destination（純擷取，不播放自己的聲音）
         }
 
         function stopMicStreaming() {
             if (processor) {
+                processor.port.onmessage = null;
                 processor.disconnect();
                 processor = null;
             }

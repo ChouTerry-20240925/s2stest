@@ -59,7 +59,7 @@ async def search_faq(query: str) -> str:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            select answer, 1 - (embedding <=> $1::vector) as similarity
+            select content, 1 - (embedding <=> $1::vector) as similarity
             from faq
             order by embedding <=> $1::vector
             limit 1
@@ -76,7 +76,7 @@ async def search_faq(query: str) -> str:
 
     if similarity < SIMILARITY_THRESHOLD:
         return "資料庫中找不到相關資訊。"
-    return row["answer"]
+    return row["content"]
 
 
 @app.websocket("/ws")
@@ -85,7 +85,8 @@ async def websocket_endpoint(client_ws: WebSocket):
 
     gemini_url = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
 
-    async with websockets.connect(gemini_url) as gemini_ws:
+    # ping_interval：每 20s 送 WebSocket ping 給 Gemini，防止 Gemini 那側閒置 timeout
+    async with websockets.connect(gemini_url, ping_interval=20, ping_timeout=10) as gemini_ws:
         async def receive_from_client():
             try:
                 while True:
@@ -131,13 +132,25 @@ async def websocket_endpoint(client_ws: WebSocket):
             except Exception as e:
                 logger.info(f"[receive_from_gemini] ended: {e}")
 
+        async def keepalive_client():
+            """每 15s 送一個 keepalive 訊息給 browser，防止 Render load balancer 切斷閒置連線"""
+            try:
+                while True:
+                    await asyncio.sleep(15)
+                    await client_ws.send_text(json.dumps({"type": "keepalive"}))
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         t1 = asyncio.create_task(receive_from_client())
         t2 = asyncio.create_task(receive_from_gemini())
+        t3 = asyncio.create_task(keepalive_client())
         try:
-            await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (t1, t2):
+            for t in (t1, t2, t3):
                 if not t.done():
                     t.cancel()
-            await asyncio.gather(t1, t2, return_exceptions=True)
+            await asyncio.gather(t1, t2, t3, return_exceptions=True)
             logger.info("[session] closed")
