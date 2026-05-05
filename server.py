@@ -19,7 +19,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 EMBEDDING_MODEL = "text-embedding-3-large"
-SIMILARITY_THRESHOLD = 0.7
+SIMILARITY_THRESHOLD = 0.4
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 db_pool: asyncpg.Pool | None = None
