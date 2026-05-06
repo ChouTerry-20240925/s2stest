@@ -56,7 +56,7 @@ const BACKEND_WS_URL = "ws://localhost:8000/ws";
    ```javascript
    const BACKEND_WS_URL = "wss://<your-service>.onrender.com/ws";
    ```
-4. `index.html` 直接雙擊在瀏覽器開啟，或透過任意 HTTP server serve。
+4. `index.html` 透過任意 HTTP server serve(如：python -m http.server 8000)，避免麥克風權限限制。
 
 > **Render 免費版冷啟動**：超過 15 分鐘無流量會 sleep，第一次連線需等 20–30 秒。
 
@@ -68,12 +68,12 @@ const BACKEND_WS_URL = "ws://localhost:8000/ws";
 create table faq (
   id bigserial primary key,
   question text,
-  answer text,         -- server.py 中 select 的欄位，需與實際欄位名稱一致
+  content text,         -- server.py 中 select 的欄位，需與實際欄位名稱一致，目前修改為 content 以符合 Supabase 的 RAG 資料欄位
   embedding vector(1536)
 );
 ```
 
-若欄位名稱不同，修改 `server.py` 中的 SQL 查詢（`select answer` 及 `row["answer"]`）以符合實際欄位名稱。
+若欄位名稱不同，修改 `server.py` 中的 SQL 查詢（`select content` 及 `row["content"]`）以符合實際欄位名稱。
 
 ## 主要修改紀錄
 
