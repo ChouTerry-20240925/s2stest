@@ -1,6 +1,6 @@
 # S2S Test（Speech-to-Speech 即時語音問答系統）
 
-以 Google Gemini Multimodal Live API 為核心的語音問答系統，透過 FastAPI proxy 保護 API Key，並結合 Supabase pgvector 實現 RAG（檢索增強生成）。
+以 Google Gemini Multimodal Live API 為核心的語音問答系統，透過 FastAPI proxy 保護 API Key，並結合 Supabase pgvector 實現 RAG（檢索增強生成）。支援 Gemini Auto VAD：說話停頓後自動回應，回答中途可直接開口打斷。
 
 ## 架構說明
 
@@ -14,7 +14,7 @@ Browser (index.html) ◀── WSS ──▶ server.py (FastAPI / Render) ◀─
                              embeddings      pgvector
 ```
 
-- **Frontend (`index.html`)**: 單一 HTML 檔，click-to-toggle 錄音介面，透過 AudioWorkletNode 擷取 16kHz PCM 音訊。
+- **Frontend (`index.html`)**: 單一 HTML 檔，按鈕切換整個 session（開始/結束對話）。連線後持續串流麥克風音訊，由 Gemini Auto VAD 偵測語音活動；Gemini 說話時可直接開口打斷。透過 AudioWorkletNode 擷取 16kHz PCM 音訊。
 - **Backend (`server.py`)**: FastAPI WebSocket proxy，攔截 Gemini 的 `toolCall` 並查詢 FAQ 資料庫，其餘訊息雙向透傳。
 - **資料庫**: Supabase Postgres + pgvector，儲存 FAQ 向量。
 
@@ -43,7 +43,7 @@ uvicorn server:app --reload
 python -m http.server 8080
 ```
 
-在 `index.html` 第 32 行將 `BACKEND_WS_URL` 改為本地位址：
+在 `index.html` 第 35 行將 `BACKEND_WS_URL` 改為本地位址：
 ```javascript
 const BACKEND_WS_URL = "ws://localhost:8000/ws";
 ```
@@ -77,21 +77,32 @@ create table faq (
 
 ## 主要修改紀錄
 
+### Auto VAD 模式（取代 Push-to-Talk）
+
+- **舊行為**：手動按住說話、放開送出（Push-to-Talk）。前端自行送 `activityStart` / `activityEnd`，Gemini 設定 `automaticActivityDetection: { disabled: true }`。
+- **新行為**：連線後持續串流音訊，由 Gemini 內建 Auto VAD 偵測語音活動。說話停頓約 0.8 秒後自動觸發回應，無需任何按鈕操作。
+- 移除 `realtimeInputConfig` 覆寫（使用 Gemini 預設值即可啟用 Auto VAD）。
+- 移除手動 `activityStart` / `activityEnd` 訊息。
+
+### 打斷（Barge-in）支援
+
+- Gemini 說話中途，使用者開口說話時，Gemini 會送出 `serverContent.interrupted`。
+- 前端收到後立即關閉並重建 `AudioContext`，清除所有已排程的音訊緩衝，幾乎無延遲地停止播放。
+
+### 按鈕改為 Session 切換
+
+- **舊行為**：五個狀態（`idle` / `connecting` / `recording` / `waiting` / `ready`），每輪問答後保持連線等待使用者按鈕繼續；20 秒無操作才斷線。
+- **新行為**：三個狀態（`idle` / `connecting` / `active`）。第一下點擊建立連線並開始持續聆聽，再次點擊斷線。閒置計時器調整為 **30 秒**（Gemini `turnComplete` 後起算，收到新的 `modelTurn` 即重設）。
+
 ### 多輪對話支援（Multi-turn conversation）
 
 - **舊行為**：`turnComplete` 後 500ms 自動關閉 WebSocket，每次按鈕建立新的 Gemini session，對話記憶消失。
-- **新行為**：`turnComplete` 後保持連線，再次按鈕時沿用同一 Gemini session；15 秒無操作才自動斷線（idle timer）。
-
-### 按鈕改為 Click-to-Toggle
-
-- **舊行為**：`mousedown` 開始錄音、`mouseup`/`mouseleave` 停止，`mouseleave` 容易意外觸發；行動裝置 touch + mouse 事件雙重觸發。
-- **新行為**：單一 `click` 事件，第一下開始錄音，再按一下停止送出。按鈕有四個狀態：`idle` / `connecting`（disabled）/ `recording` / `waiting`（disabled）/ `ready`。
+- **新行為**：`turnComplete` 後保持連線，同一 Gemini session 中上下文持續累積。
 
 ### AudioWorklet 取代 ScriptProcessorNode
 
 - `ScriptProcessorNode` 已棄用且在主執行緒執行，改為 `AudioWorkletNode`（獨立 audio thread）。
 - Worklet 程式碼以 inline Blob 方式載入，不需要額外的 `.js` 檔案。
-- `activityStart` 改為等待 `await startMicStreaming()` 完成後才送出，確保 mic 與 Worklet 就緒後才通知 Gemini 開始接收音訊。
 
 ### WebSocket Keepalive（防止 Render 切斷閒置連線）
 
