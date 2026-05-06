@@ -129,8 +129,18 @@ registerProcessor('pcm-processor', PCMProcessor);
             initPlayAudio();
             try {
                 ws = new WebSocket(BACKEND_WS_URL);
+                setSubStatus("連線中，伺服器可能需要 20–30 秒喚醒...");
+
+                const connectTimeout = setTimeout(() => {
+                    if (btnState === 'connecting') {
+                        addLog("連線逾時，伺服器可能正在冷啟動，請稍後再試。");
+                        setSubStatus("連線逾時，請稍後重試");
+                        ws.close();
+                    }
+                }, 20000);
 
                 ws.onopen = async () => {
+                    clearTimeout(connectTimeout);
                     updateStatus(true);
                     ws.send(JSON.stringify({
                         setup: {
@@ -189,6 +199,7 @@ registerProcessor('pcm-processor', PCMProcessor);
                 };
 
                 ws.onclose = () => {
+                    clearTimeout(connectTimeout);
                     updateStatus(false);
                     stopMicStreaming();
                     clearAudioQueue();

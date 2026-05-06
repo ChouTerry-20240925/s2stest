@@ -58,7 +58,7 @@ const BACKEND_WS_URL = "ws://localhost:8000/ws";
    ```
 4. `index.html` 透過任意 HTTP server serve(如：python -m http.server 8000)，避免麥克風權限限制。
 
-> **Render 免費版冷啟動**：超過 15 分鐘無流量會 sleep，第一次連線需等 20–30 秒。
+> **Render 免費版冷啟動**：超過 15 分鐘無流量會 sleep，第一次連線需等 20–30 秒。前端已內建 **20 秒連線逾時**：若 WebSocket 在時限內未建立成功，會自動關閉並顯示提示，使用者可再次點擊重試。
 
 ## Supabase 資料表設定
 
@@ -103,6 +103,12 @@ create table faq (
 
 - `ScriptProcessorNode` 已棄用且在主執行緒執行，改為 `AudioWorkletNode`（獨立 audio thread）。
 - Worklet 程式碼以 inline Blob 方式載入，不需要額外的 `.js` 檔案。
+
+### 冷啟動連線逾時保護
+
+- 點擊「開始對話」後，前端立即顯示提示：「連線中，伺服器可能需要 20–30 秒喚醒...」
+- 啟動 **20 秒計時器**；若 WebSocket `onopen` 在時限內未觸發，自動呼叫 `ws.close()`，按鈕恢復可點擊，並在日誌顯示逾時訊息。
+- 解決 Render 免費版冷啟動時按鈕被鎖住、使用者無法操作的問題。
 
 ### WebSocket Keepalive（防止 Render 切斷閒置連線）
 
